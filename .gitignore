@@ -9,3 +9,4 @@ __pycache__/
 logs/
 wg_configs/
 user_*.conf
+*.db

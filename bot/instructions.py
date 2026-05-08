@@ -1,7 +1,7 @@
 # Детальные инструкции для всех устройств с поддержкой AmneziaWG
 
 INSTRUCTIONS = {
-    'ios': """
+    "ios": """
 📱 <b>Настройка AmneziaVPN на iPhone / iPad</b>
 
 <b>⚠️ ВАЖНО:</b> Используйте только приложение <b>AmneziaVPN</b>! Стандартный WireGuard НЕ подойдёт — конфиг содержит параметры маскировки (Jc, Jmin, S1-S2, H1-H4).
@@ -41,8 +41,7 @@ INSTRUCTIONS = {
 
 <b>💡 Совет:</b> Добавьте виджет AmneziaVPN на экран виджетов для быстрого включения.
 """,
-
-    'android': """
+    "android": """
 🤖 <b>Настройка AmneziaVPN на Android</b>
 
 <b>⚠️ ВАЖНО:</b> Используйте только <b>AmneziaVPN</b>! Стандартный WireGuard НЕ поддерживает параметры маскировки (Jc, Jmin, S1-S2, H1-H4).
@@ -89,8 +88,7 @@ INSTRUCTIONS = {
 • Настройки → Сеть и интернет → VPN → AmneziaVPN → <b>Всегда включен</b>
 • Это защитит от утечек при переподключении
 """,
-
-    'windows': """
+    "windows": """
 💻 <b>Настройка AmneziaVPN на Windows</b>
 
 <b>⚠️ ВАЖНО:</b> Стандартный WireGuard для Windows НЕ поддерживает AmneziaWG! Используйте только <b>AmneziaVPN</b>.
@@ -145,8 +143,7 @@ INSTRUCTIONS = {
 
 <b>⚠️ НЕ используйте официальный WireGuard для Windows</b> — он не поймёт параметры маскировки!
 """,
-
-    'macos': """
+    "macos": """
 🍎 <b>Настройка AmneziaVPN на macOS</b>
 
 <b>⚠️ ВАЖНО:</b> WireGuard из App Store НЕ поддерживает AmneziaWG! Используйте только <b>AmneziaVPN</b>.
@@ -196,8 +193,7 @@ INSTRUCTIONS = {
 • Проверьте разрешения в Системных настройках → Конфиденциальность
 • Попробуйте перезагрузить Mac после установки
 """,
-
-    'linux': """
+    "linux": """
 🐧 <b>Настройка AmneziaWG на Linux</b>
 
 <b>⚠️ ВАЖНО:</b> Стандартный WireGuard НЕ поддерживает параметры маскировки! Нужен <b>AmneziaWG</b>.
@@ -264,8 +260,7 @@ PostDown = resolvectl revert wg0
 
 <b>⚠️ НЕ используйте wg-quick — только awg-quick!</b>
 """,
-
-    'keenetic': """
+    "keenetic": """
 📡 <b>Настройка AmneziaWG на Keenetic (роутер)</b>
 
 <b>⚠️ Важно:</b> Стандартный WireGuard в Keenetic НЕ поддерживает параметры маскировки (Jc, Jmin...). Нужна установка AmneziaWG через Entware.
@@ -347,8 +342,7 @@ curl ifconfig.me
 
 <b>⚠️ Стандартный WireGuard в Keenetic не подойдёт!</b> Только через Entware + AmneziaWG.
 """,
-
-    'routers': """
+    "routers": """
 🌐 <b>Настройка AmneziaWG на других роутерах</b>
 
 <b>⚠️ Важно:</b> Стандартный WireGuard НЕ поддерживает параметры маскировки AmneziaWG (Jc, Jmin, S1-S2, H1-H4). Нужна установка AmneziaWG вручную.
@@ -411,11 +405,13 @@ opkg install amneziawg-tools luci-app-amneziawg
 
 <b>📱 Альтернатива роутеру:</b>
 Если роутер слабый — настройте AmneziaVPN на телефоне/компьютере отдельно для каждого устройства.
-"""
+""",
 }
+
 
 def get_instruction_text(device_type: str) -> str:
     return INSTRUCTIONS.get(device_type, "Инструкция не найдена")
+
 
 def get_all_instructions_text() -> str:
     return """
