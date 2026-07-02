@@ -36,6 +36,9 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(formatter)
 root_logger.addHandler(console_handler)
 
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,6 +85,12 @@ async def send_payment_reminder(context: ContextTypes.DEFAULT_TYPE):
 
         next_run = add_months(now, 1)
         delay = (next_run - now).total_seconds()
+        if context.job_queue is None:
+            logger.warning(
+                "Job queue unavailable; next payment reminder was not scheduled"
+            )
+            return
+
         # Планируем следующую отправку
         context.job_queue.run_once(send_payment_reminder, when=delay)
         logger.info(
@@ -820,47 +829,26 @@ def main():
     # Инициализируем приложение (создаст job_queue), затем планируем первоначальную отправку напоминания
     try:
         asyncio.get_event_loop().run_until_complete(application.initialize())
-        if config.ADMIN_IDS:
-            application.job_queue.run_once(send_payment_reminder, when=0)
+        job_queue = application.job_queue
+        if job_queue is None:
+            logger.warning(
+                "Job queue unavailable; payment reminders and auto-renewal are disabled"
+            )
+        elif config.ADMIN_IDS:
+            job_queue.run_once(send_payment_reminder, when=0)
             logger.info("Initial payment reminder scheduled (now)")
         else:
             logger.warning("ADMIN_IDS is empty — reminders will not be sent")
 
-        # Авто-продление подписок — каждый день в 10:00
-        application.job_queue.run_daily(
-            auto_renew_subscriptions,
-            time=datetime.time(hour=10, minute=0),
-        )
-        logger.info("Auto-renewal job scheduled daily at 10:00")
+        if job_queue is not None:
+            # Авто-продление подписок — каждый день в 10:00
+            job_queue.run_daily(
+                auto_renew_subscriptions,
+                time=datetime.time(hour=10, minute=0),
+            )
+            logger.info("Auto-renewal job scheduled daily at 10:00")
     except Exception as e:
         logger.error(f"Failed to initialize application / schedule initial payment reminder: {e}")
-
-    # Если job_queue по-прежнему не инициализирована к этому моменту, создаём фоновый поток,
-    # который подождёт появление job_queue и затем запланирует первую рассылку.
-    def _wait_and_schedule():
-        try:
-            wait_seconds = 0
-            while wait_seconds < 30:
-                jq = getattr(application, 'job_queue', None)
-                if jq is not None:
-                    if config.ADMIN_IDS:
-                        try:
-                            jq.run_once(send_payment_reminder, when=0)
-                            logger.info('Initial payment reminder scheduled by background waiter')
-                        except Exception as e:
-                            logger.error(f'Background scheduling failed: {e}')
-                    else:
-                        logger.warning('ADMIN_IDS is empty — background scheduler did not schedule reminders')
-                    return
-                time.sleep(0.5)
-                wait_seconds += 0.5
-            logger.error('Timeout waiting for application.job_queue to become available')
-        except Exception as e:
-            logger.error(f'Error in background scheduler: {e}')
-
-    import time
-    scheduler_thread = threading.Thread(target=_wait_and_schedule, daemon=True)
-    scheduler_thread.start()
 
     # Запускаем webhook сервер в отдельном потоке
     webhook_thread = threading.Thread(target=run_webhook_server, daemon=True)

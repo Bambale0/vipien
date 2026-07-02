@@ -13,26 +13,27 @@ class PaymentManager:
         self.test_mode = config.YOOKASSA_TEST_MODE
 
     async def create_payment(self, user_id: int, amount: int, description: str) -> dict:
-        """Создает платеж в ЮKassa с сохранением карты"""
+        """Создает разовый платеж в ЮKassa"""
         idempotence_key = str(uuid.uuid4())
 
         bot_username = config.BOT_USERNAME or config.BOT_TOKEN.split(":")[0]
 
-        payment = Payment.create(
-            {
-                "amount": {"value": f"{amount}.00", "currency": "RUB"},
-                "confirmation": {
-                    "type": "redirect",
-                    "return_url": f"https://t.me/{bot_username}",
-                },
-                "capture": True,
-                "save_payment_method": True,
-                "description": description,
-                "metadata": {"user_id": str(user_id), "telegram": "true"},
-                "test": self.test_mode,
+        payment_payload = {
+            "amount": {"value": f"{amount}.00", "currency": "RUB"},
+            "confirmation": {
+                "type": "redirect",
+                "return_url": f"https://t.me/{bot_username}",
             },
-            idempotence_key,
-        )
+            "capture": True,
+            "description": description,
+            "metadata": {"user_id": str(user_id), "telegram": "true"},
+            "test": self.test_mode,
+        }
+
+        if config.YOOKASSA_SAVE_PAYMENT_METHOD:
+            payment_payload["save_payment_method"] = True
+
+        payment = Payment.create(payment_payload, idempotence_key)
 
         return {
             "payment_id": payment.id,

@@ -4,7 +4,6 @@ import datetime
 import fcntl
 import logging
 import os
-import random
 import subprocess
 import tempfile
 import time
@@ -62,13 +61,61 @@ class WireGuardManager:
         """Получает публичный ключ сервера AmneziaWG"""
         return config.WG_SERVER_PUBLIC_KEY
 
+    def _get_server_config_path(self) -> str:
+        return config.WG_CONFIG_PATH or "/etc/amnezia/amneziawg/wg0.conf"
+
+    def _get_config_allowed_ips(self):
+        """Возвращает клиентские IP, уже сохраненные в server config."""
+        server_config_path = self._get_server_config_path()
+        try:
+            try:
+                read_proc = subprocess.run(
+                    ["sudo", "cat", server_config_path],
+                    capture_output=True,
+                    text=True,
+                )
+                if read_proc.returncode == 0:
+                    config_content = read_proc.stdout
+                else:
+                    with open(server_config_path, "r") as f:
+                        config_content = f.read()
+            except Exception:
+                with open(server_config_path, "r") as f:
+                    config_content = f.read()
+
+            used_ips = set()
+            for line in config_content.splitlines():
+                stripped = line.strip()
+                if not stripped.startswith("AllowedIPs") or "=" not in stripped:
+                    continue
+                _, value = stripped.split("=", 1)
+                for entry in value.split(","):
+                    ip = entry.strip().split("/")[0]
+                    if ip.startswith("10.8.1."):
+                        used_ips.add(ip)
+            return used_ips
+        except Exception as e:
+            self.logger.debug(f"Failed to read saved allowed IPs: {e}")
+            return set()
+
+    @staticmethod
+    def _allowed_ip_is_present(output: str, public_key: str, allowed_ip: str) -> bool:
+        expected_ip = f"{allowed_ip}/32"
+        for line in output.splitlines():
+            parts = line.split()
+            if len(parts) < 2 or parts[0] != public_key:
+                continue
+            allowed_ips = " ".join(parts[1:]).replace(",", " ").split()
+            return expected_ip in allowed_ips
+        return False
+
     def get_next_ip(self) -> Optional[str]:
         """Находит следующий свободный IP в сети 10.8.1.0/24"""
         try:
             # Получаем список всех allowed-ips из awg (AmneziaWG)
             output = (
                 subprocess.check_output(
-                    ["sudo", "awg", "show", "wg0", "allowed-ips"],
+                    ["sudo", "awg", "show", config.WG_INTERFACE, "allowed-ips"],
                     stderr=subprocess.DEVNULL,
                 )
                 .decode()
@@ -102,6 +149,8 @@ class WireGuardManager:
             except Exception as db_error:
                 print(f"Database check error: {db_error}")
 
+            used_ips.update(self._get_config_allowed_ips())
+
             # Ищем свободный IP в диапазоне 10.8.1.2 - 10.8.1.254
             for i in range(2, 255):
                 ip = f"10.8.1.{i}"
@@ -117,31 +166,31 @@ class WireGuardManager:
             # Fallback - генерируем случайный IP с проверкой в базе данных
             import sqlite3
 
-            for _ in range(10):  # Попробуем 10 случайных IP
-                ip = f"10.8.1.{random.randint(2, 254)}"
-                try:
-                    conn = sqlite3.connect("wg_bot.db")
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT COUNT(*) FROM configs WHERE address = ?", (ip,)
-                    )
-                    count = cursor.fetchone()[0]
-                    conn.close()
+            used_ips = self._get_config_allowed_ips()
+            try:
+                conn = sqlite3.connect("wg_bot.db")
+                cursor = conn.cursor()
+                cursor.execute("SELECT address FROM configs")
+                used_ips.update(row[0] for row in cursor.fetchall())
+                conn.close()
+            except Exception:
+                pass
 
-                    if count == 0:
-                        print(f"Using random free IP: {ip}")
-                        return ip
-                except:
-                    pass
+            for i in range(2, 255):
+                ip = f"10.8.1.{i}"
+                if ip not in used_ips:
+                    print(f"Using fallback free IP: {ip}")
+                    return ip
 
-            # Если не нашли свободный, возвращаем любой
-            return f"10.8.1.{random.randint(2, 254)}"
+            return None
 
     def generate_config(self, user_id: int, config_num: int) -> dict:
         """Генерирует полный конфиг AmneziaWG для пользователя"""
         private_key, public_key = self.generate_keypair()
         preshared_key = self.generate_preshared_key()
         address = self.get_next_ip()
+        if address is None:
+            raise RuntimeError("No free WireGuard client IPs available")
         server_public_key = self.get_server_public_key()
 
         config_name = f"user_{user_id}_{config_num}"
@@ -239,7 +288,7 @@ PersistentKeepalive = 25
         try:
             # Проверяем существование пира
             try:
-                check_cmd = ["sudo", "awg", "show", "wg0", "peers"]
+                check_cmd = ["sudo", "awg", "show", config.WG_INTERFACE, "peers"]
                 result = subprocess.run(check_cmd, capture_output=True, text=True)
                 peer_exists = public_key in (result.stdout or "")
             except Exception as e:
@@ -249,7 +298,15 @@ PersistentKeepalive = 25
             if peer_exists:
                 try:
                     subprocess.run(
-                        ["sudo", "awg", "set", "wg0", "peer", public_key, "remove"],
+                        [
+                            "sudo",
+                            "awg",
+                            "set",
+                            config.WG_INTERFACE,
+                            "peer",
+                            public_key,
+                            "remove",
+                        ],
                         check=False,
                         capture_output=True,
                         text=True,
@@ -273,7 +330,7 @@ PersistentKeepalive = 25
                 "sudo",
                 "awg",
                 "set",
-                "wg0",
+                config.WG_INTERFACE,
                 "peer",
                 public_key,
                 "preshared-key",
@@ -311,12 +368,21 @@ PersistentKeepalive = 25
 
             # Проверяем, что allowed-ips содержит новую запись — если нет, пробуем ещё раз
             try:
-                show_cmd = ["sudo", "awg", "show", "wg0", "allowed-ips"]
+                show_cmd = [
+                    "sudo",
+                    "awg",
+                    "show",
+                    config.WG_INTERFACE,
+                    "allowed-ips",
+                ]
                 verify = subprocess.run(show_cmd, capture_output=True, text=True)
                 out = verify.stdout or ""
-                if public_key in out or f"{allowed_ip}/32" in out:
+                if self._allowed_ip_is_present(out, public_key, allowed_ip):
                     self.logger.info(
                         f"Verified peer present in awg allowed-ips: {public_key[:8]} -> {allowed_ip}"
+                    )
+                    self._save_peer_to_config_file(
+                        public_key, preshared_key, allowed_ip
                     )
                 else:
                     # one more attempt to append config and reload
@@ -338,7 +404,7 @@ PersistentKeepalive = 25
                     # Final verification after fallback
                     verify2 = subprocess.run(show_cmd, capture_output=True, text=True)
                     out2 = verify2.stdout or ""
-                    if public_key in out2 or f"{allowed_ip}/32" in out2:
+                    if self._allowed_ip_is_present(out2, public_key, allowed_ip):
                         self.logger.info(
                             f"Peer visible after fallback append: {public_key[:8]} -> {allowed_ip}"
                         )
@@ -383,7 +449,7 @@ PersistentKeepalive = 25
     ):
         """Сохраняет пира в конфигурационный файл /etc/amnezia/amneziawg/wg0.conf"""
         try:
-            server_config_path = "/etc/amnezia/amneziawg/wg0.conf"
+            server_config_path = self._get_server_config_path()
             # Читаем текущий конфиг через sudo, на случай если бот не root
             try:
                 read_proc = subprocess.run(
