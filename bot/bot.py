@@ -47,7 +47,7 @@ def run_webhook_server():
     try:
         logger.info("Starting webhook server in background thread...")
         # handle_signals=False - отключаем обработку сигналов для работы в потоке
-        webhook_handler.run(host="0.0.0.0", port=8080, handle_signals=False)
+        webhook_handler.run(\n            host=config.WEBHOOK_HOST, port=config.WEBHOOK_PORT, handle_signals=False\n        )
     except Exception as e:
         logger.error(f"Webhook server error: {e}")
 
