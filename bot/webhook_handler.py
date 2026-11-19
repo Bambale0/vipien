@@ -2,13 +2,14 @@ import asyncio
 import ipaddress
 import json
 import logging
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 
 import aiosqlite
 from aiohttp import web
 from config import config
 from database import db
-from yookassa import Configuration, Webhook
+from yookassa import Configuration, Webhook, Payment, Refund
 
 # Настройка логирования
 logger = logging.getLogger(__name__)
@@ -59,6 +60,76 @@ def is_yookassa_ip(ip_str: str) -> bool:
         return False
     except ValueError:
         return False
+
+
+def _amount_matches(provider_amount, payload_amount) -> bool:
+    """Compare provider-authoritative money values to the callback."""
+    try:
+        verified = Decimal(str(provider_amount.value))
+        received = Decimal(str(payload_amount["value"]))
+        return (
+            verified.is_finite() and received.is_finite()
+            and verified == received
+            and str(provider_amount.currency).upper() ==
+            str(payload_amount["currency"]).upper()
+        )
+    except (AttributeError, KeyError, TypeError, ValueError, InvalidOperation):
+        return False
+
+
+async def _verify_provider_notification(event_type: str, event_object: dict) -> bool:
+    """Fail closed: webhook body and forwarded IP are NOT payment evidence.
+
+    Fetch the payment/refund independently using the configured YooKassa
+    credentials before allowing any local financial state transition.
+    """
+    if not isinstance(event_object, dict) or not event_object.get("id"):
+        return False
+    expected = {
+        "payment.succeeded": "succeeded",
+        "payment.canceled": "canceled",
+        "payment.waiting_for_capture": "waiting_for_capture",
+        "refund.succeeded": "succeeded",
+    }.get(event_type)
+    if not expected:
+        return False
+    ref_id = str(event_object["id"])
+    is_refund = event_type.startswith("refund.")
+    remote = await asyncio.to_thread(
+        Refund.find_one if is_refund else Payment.find_one, ref_id
+    )
+    if remote is None or str(getattr(remote, "id", "")) != ref_id:
+        return False
+    if str(getattr(remote, "status", "")).lower() != expected:
+        return False
+    if event_type == "payment.succeeded" and getattr(remote, "paid", False) is not True:
+        return False
+    if not _amount_matches(getattr(remote, "amount", None),
+                           event_object.get("amount") or {}):
+        return False
+
+    if is_refund and (
+        str(getattr(remote, "payment_id", "")) !=
+        str(event_object.get("payment_id", ""))
+    ):
+        return False
+
+    # Card credentials in callback metadata must match the independent
+    # provider lookup before saving a reusable payment method.
+    claimed_method = event_object.get("payment_method") or {}
+    if not isinstance(claimed_method, dict):
+        return False
+    if claimed_method.get("id"):
+        verified_method = getattr(remote, "payment_method", None)
+        if (
+            verified_method is None
+            or str(getattr(verified_method, "id", "")) != str(claimed_method["id"])
+            or bool(claimed_method.get("saved")) != bool(
+                getattr(verified_method, "saved", False)
+            )
+        ):
+            return False
+    return True
 
 
 class WebhookHandler:
@@ -116,6 +187,25 @@ class WebhookHandler:
             event_object = payload.get("object", {})
 
             logger.info(f"Received webhook event: {event_type}")
+
+            state_changing_events = {
+                "payment.succeeded", "payment.canceled",
+                "payment.waiting_for_capture", "refund.succeeded",
+            }
+            if event_type in state_changing_events:
+                try:
+                    authentic = await _verify_provider_notification(
+                        event_type, event_object
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "YooKassa independent verification unavailable: %s",
+                        type(exc).__name__,
+                    )
+                    return web.Response(status=503, text="Provider verification unavailable")
+                if not authentic:
+                    logger.warning("Rejected unverified YooKassa notification")
+                    return web.Response(status=403, text="Unverified notification")
 
             # Обработка событий платежей
             if event_type == "payment.succeeded":
@@ -184,11 +274,37 @@ class WebhookHandler:
             subscription_id = payment_data["subscription_id"]
             plan_id = payment_data["plan_id"]
 
-            # Обновляем статус платежа
-            await db.confirm_payment(payment_id)
+            # Independent of the remote check, never settle a payment with an
+            # amount that differs from the recorded order, even by 1 kopeck.
+            try:
+                expected_amount = Decimal(str(payment_data["amount"]))
+                received_amount = Decimal(str(amount))
+            except (TypeError, InvalidOperation) as exc:
+                raise ValueError("Invalid payment amount") from exc
+            if (
+                not expected_amount.is_finite()
+                or not received_amount.is_finite()
+                or received_amount != expected_amount
+                or str(currency).upper() != "RUB"
+            ):
+                raise ValueError("YooKassa amount/currency does not match local order")
 
-            # Активируем подписку
+            # One SQLite write transaction makes repeated notifications
+            # idempotent and the payment/subscription transition atomic.
             async with aiosqlite.connect(db.db_path) as conn:
+                await conn.execute("BEGIN IMMEDIATE")
+                cursor = await conn.execute(
+                    """UPDATE payments
+                       SET status = 'succeeded', paid_at = CURRENT_TIMESTAMP
+                       WHERE payment_id = ?
+                         AND status IN ('pending', 'waiting_for_capture', 'canceled')
+                    """,
+                    (payment_id,),
+                )
+                if cursor.rowcount != 1:
+                    await conn.rollback()
+                    logger.info("YooKassa duplicate or terminal payment ignored")
+                    return
                 await conn.execute(
                     'UPDATE subscriptions SET status = "active" WHERE id = ?',
                     (subscription_id,),
@@ -242,7 +358,8 @@ class WebhookHandler:
             # Обновляем статус платежа
             async with aiosqlite.connect(db.db_path) as conn:
                 await conn.execute(
-                    'UPDATE payments SET status = "canceled" WHERE payment_id = ?',
+                    """UPDATE payments SET status = 'canceled'
+                       WHERE payment_id = ? AND status IN ('pending', 'waiting_for_capture')""",
                     (payment_id,),
                 )
                 await conn.commit()
@@ -272,7 +389,8 @@ class WebhookHandler:
             # Обновляем статус платежа
             async with aiosqlite.connect(db.db_path) as conn:
                 await conn.execute(
-                    'UPDATE payments SET status = "waiting_for_capture" WHERE payment_id = ?',
+                    """UPDATE payments SET status = 'waiting_for_capture'
+                       WHERE payment_id = ? AND status = 'pending'""",
                     (payment_id,),
                 )
                 await conn.commit()
