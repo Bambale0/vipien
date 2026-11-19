@@ -17,6 +17,7 @@ import sys
 # Добавляем путь к проекту
 sys.path.insert(0, "/opt/wg-bot")
 
+from config import config
 from webhook_handler import set_telegram_app, webhook_handler
 
 # Настройка логирования
@@ -27,13 +28,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def run_standalone(host="0.0.0.0", port=8080):
+def run_standalone(host=None, port=None):
     """
     Запускает вебхук сервер в standalone режиме.
 
     В этом режиме webhook обрабатывает платежи, но не отправляет
     уведомления в Telegram (так как бот запущен отдельно).
     """
+    host = host or config.WEBHOOK_HOST
+    port = port or config.WEBHOOK_PORT
     logger.info("🚀 Запуск вебхук сервера ЮKassa (standalone режим)")
     logger.info(
         f"📍 Вебхуки будут доступны по адресу: http://{host}:{port}/webhook/yookassa"
@@ -54,8 +57,8 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="YooKassa Webhook Server")
-    parser.add_argument("--host", default="0.0.0.0", help="Хост для прослушивания")
-    parser.add_argument("--port", type=int, default=8080, help="Порт для прослушивания")
+    parser.add_argument("--host", default=config.WEBHOOK_HOST, help="Хост для прослушивания")
+    parser.add_argument("--port", type=int, default=config.WEBHOOK_PORT, help="Порт для прослушивания")
     parser.add_argument(
         "--standalone", action="store_true", help="Запуск в standalone режиме"
     )
