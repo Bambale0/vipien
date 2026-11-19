@@ -4,12 +4,14 @@ import json
 import logging
 from decimal import Decimal, InvalidOperation
 from datetime import datetime
+from uuid import UUID
 
 import aiosqlite
+import requests
 from aiohttp import web
 from config import config
 from database import db
-from yookassa import Configuration, Webhook, Payment, Refund
+from yookassa import Configuration, Webhook
 
 # Настройка логирования
 logger = logging.getLogger(__name__)
@@ -63,27 +65,28 @@ def is_yookassa_ip(ip_str: str) -> bool:
 
 
 def _amount_matches(provider_amount, payload_amount) -> bool:
-    """Compare provider-authoritative money values to the callback."""
+    """Compare authoritative YooKassa money values with the webhook."""
     try:
-        verified = Decimal(str(provider_amount.value))
+        verified = Decimal(str(provider_amount["value"]))
         received = Decimal(str(payload_amount["value"]))
         return (
             verified.is_finite() and received.is_finite()
             and verified == received
-            and str(provider_amount.currency).upper() ==
+            and str(provider_amount["currency"]).upper() ==
             str(payload_amount["currency"]).upper()
         )
-    except (AttributeError, KeyError, TypeError, ValueError, InvalidOperation):
+    except (KeyError, TypeError, ValueError, InvalidOperation):
         return False
 
 
 async def _verify_provider_notification(event_type: str, event_object: dict) -> bool:
-    """Fail closed: webhook body and forwarded IP are NOT payment evidence.
+    """Validate every financial callback by an independent bounded HTTPS GET.
 
-    Fetch the payment/refund independently using the configured YooKassa
-    credentials before allowing any local financial state transition.
+    Do not trust forwarded IP or webhook JSON alone. The installed YooKassa
+    SDK's Payment.find_one currently stalls on this host; use requests with
+    explicit connect/read timeouts and TLS certificate validation instead.
     """
-    if not isinstance(event_object, dict) or not event_object.get("id"):
+    if not isinstance(event_object, dict):
         return False
     expected = {
         "payment.succeeded": "succeeded",
@@ -93,39 +96,60 @@ async def _verify_provider_notification(event_type: str, event_object: dict) -> 
     }.get(event_type)
     if not expected:
         return False
-    ref_id = str(event_object["id"])
+
+    ref_id = str(event_object.get("id") or "")
+    try:
+        UUID(ref_id)
+    except (ValueError, TypeError):
+        return False
     is_refund = event_type.startswith("refund.")
-    remote = await asyncio.to_thread(
-        Refund.find_one if is_refund else Payment.find_one, ref_id
-    )
-    if remote is None or str(getattr(remote, "id", "")) != ref_id:
+    resource = "refunds" if is_refund else "payments"
+    url = f"https://api.yookassa.ru/v3/{resource}/{ref_id}"
+    credentials = (config.YOOKASSA_SHOP_ID, config.YOOKASSA_SECRET_KEY)
+    if not all(credentials):
+        raise RuntimeError("YooKassa credentials missing")
+
+    # One bounded retry absorbs transient TLS connect/read timeouts without
+    # extending beyond Nginx's 30-second webhook proxy timeout.
+    for attempt in range(2):
+        try:
+            response = await asyncio.to_thread(
+                requests.get, url, auth=credentials, timeout=(4, 6)
+            )
+            break
+        except requests.exceptions.Timeout:
+            if attempt:
+                raise
+            await asyncio.sleep(0.2)
+    if response.status_code == 404:
         return False
-    if str(getattr(remote, "status", "")).lower() != expected:
+    response.raise_for_status()
+    remote = response.json()
+    if not isinstance(remote, dict):
         return False
-    if event_type == "payment.succeeded" and getattr(remote, "paid", False) is not True:
+    if str(remote.get("id") or "") != ref_id:
         return False
-    if not _amount_matches(getattr(remote, "amount", None),
+    if str(remote.get("status") or "").lower() != expected:
+        return False
+    if event_type == "payment.succeeded" and remote.get("paid") is not True:
+        return False
+    if not _amount_matches(remote.get("amount") or {},
                            event_object.get("amount") or {}):
         return False
-
-    if is_refund and (
-        str(getattr(remote, "payment_id", "")) !=
-        str(event_object.get("payment_id", ""))
+    if is_refund and str(remote.get("payment_id") or "") != str(
+        event_object.get("payment_id") or ""
     ):
         return False
-
-    # Card credentials in callback metadata must match the independent
-    # provider lookup before saving a reusable payment method.
     claimed_method = event_object.get("payment_method") or {}
     if not isinstance(claimed_method, dict):
         return False
     if claimed_method.get("id"):
-        verified_method = getattr(remote, "payment_method", None)
+        verified_method = remote.get("payment_method") or {}
         if (
-            verified_method is None
-            or str(getattr(verified_method, "id", "")) != str(claimed_method["id"])
+            not isinstance(verified_method, dict)
+            or str(verified_method.get("id") or "") != str(claimed_method["id"])
             or bool(claimed_method.get("saved")) != bool(
-                getattr(verified_method, "saved", False)
+                verified_method.get("saved")
             )
         ):
             return False
