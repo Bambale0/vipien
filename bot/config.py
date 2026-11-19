@@ -51,7 +51,9 @@ class Config:
     DB_PATH = "wg_bot.db"
 
     # Webhook настройки
-    WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
+    # Nginx terminates TLS and proxies the payment webhook to loopback.
+    # External binding requires an explicit WEBHOOK_HOST override.
+    WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "127.0.0.1")
     WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
     WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook/yookassa")
     WEBHOOK_URL = os.getenv(

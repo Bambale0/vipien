@@ -1,0 +1,23 @@
+name: Webhook binding security checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  webhook-binding:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test-only dependencies
+        run: python -m pip install --disable-pip-version-check python-dotenv
+      - name: Compile bot sources
+        run: python -m compileall -q bot
+      - name: Safe bind regression
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
